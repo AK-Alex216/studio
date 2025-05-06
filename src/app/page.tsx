@@ -1,13 +1,15 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, StopCircle, Download, Loader2, Upload, FileAudio } from 'lucide-react';
+import { Mic, StopCircle, Download, Loader2, Upload, FileAudio, Play, Pause, Wand2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Card, CardContent, CardHeader, CardTitle, CardFooter } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { useToast } from '@/hooks/use-toast';
+import { transcribeAudio } from '@/ai/flows/transcribe-audio-flow'; // Import the new flow
+import { summarizeTranscription } from '@/ai/flows/summarize-transcription';
 
 // Check if the browser supports the SpeechRecognition API
 const SpeechRecognition =
@@ -20,16 +22,36 @@ export default function Home() {
   const [isClient, setIsClient] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   const [uploadedAudioDataUri, setUploadedAudioDataUri] = useState<string | null>(null);
-  const [isProcessingUpload, setIsProcessingUpload] = useState(false); // To show loading for upload processing
+  const [isProcessing, setIsProcessing] = useState(false); // Combined processing state
+  const [isPlaying, setIsPlaying] = useState(false); // Audio playback state
+  const [isSummarizing, setIsSummarizing] = useState(false);
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const { toast } = useToast();
 
   // Ensure code runs only on the client
   useEffect(() => {
     setIsClient(true);
-  }, []);
+    // Initialize audio element
+    audioRef.current = new Audio();
+    audioRef.current.onended = () => setIsPlaying(false);
+    audioRef.current.onpause = () => setIsPlaying(false); // Handle pause as well
+    audioRef.current.onerror = () => {
+       setIsPlaying(false);
+       toast({ title: "Audio Error", description: "Could not play the audio file.", variant: "destructive" });
+    }
+
+    // Cleanup audio element
+    return () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.src = ''; // Release object URL/data URI
+      }
+    };
+  }, [toast]);
+
 
   const initializeSpeechRecognition = useCallback(() => {
     if (!SpeechRecognition) {
@@ -81,10 +103,11 @@ export default function Home() {
         variant: 'destructive',
       });
       setIsRecording(false); // Stop recording state on error
+      setIsProcessing(false);
     };
 
     recognition.onend = () => {
-       // Only reset if the user didn't manually stop
+       // Only reset if the user didn't manually stop or an error occured
       if (isRecording && recognitionRef.current) {
          // If still recording, restart listening. This handles cases where the service might time out.
          try {
@@ -93,9 +116,11 @@ export default function Home() {
             // Handle potential errors if start() fails immediately after stop() was called.
             console.warn("Could not restart recognition immediately:", err);
             setIsRecording(false);
+            setIsProcessing(false);
          }
       } else {
         setIsRecording(false); // Ensure state is updated if stopped manually or due to error
+        setIsProcessing(false);
       }
     };
 
@@ -103,7 +128,7 @@ export default function Home() {
   }, [toast, isRecording]); // Add isRecording to dependencies to correctly handle restart logic
 
   const startRecording = useCallback(() => {
-    if (!isClient || !SpeechRecognition) return;
+    if (!isClient || !SpeechRecognition || isProcessing || isRecording) return;
     if (uploadedFileName) {
       toast({
         title: 'Clear Upload First',
@@ -122,6 +147,7 @@ export default function Home() {
           setFinalTranscript(''); // Clear previous transcript
           setInterimTranscript('');
           setIsRecording(true);
+          setIsProcessing(true); // Set processing state
           try {
             recognition.start();
             toast({
@@ -136,6 +162,7 @@ export default function Home() {
               variant: 'destructive',
             });
             setIsRecording(false);
+            setIsProcessing(false);
           }
         }
       })
@@ -147,12 +174,12 @@ export default function Home() {
           variant: 'destructive',
         });
       });
-  }, [isClient, initializeSpeechRecognition, toast, uploadedFileName]);
+  }, [isClient, initializeSpeechRecognition, toast, uploadedFileName, isProcessing, isRecording]);
 
   const stopRecording = useCallback(() => {
     if (recognitionRef.current && isRecording) {
       recognitionRef.current.stop();
-      // isRecording state is set to false in recognition.onend
+      // isRecording and isProcessing state are set to false in recognition.onend
       setInterimTranscript(''); // Clear interim transcript on stop
       toast({
         title: 'Recording Stopped',
@@ -207,22 +234,45 @@ export default function Home() {
       setFinalTranscript(''); // Clear any existing transcript
       setInterimTranscript('');
 
-      setIsProcessingUpload(true); // Start loading indicator
+      setIsProcessing(true); // Start loading indicator for file reading AND transcription
       setUploadedFileName('Processing...');
+      setUploadedAudioDataUri(null); // Clear previous audio data
 
       const reader = new FileReader();
-      reader.onloadend = () => {
-        setUploadedAudioDataUri(reader.result as string);
-        setUploadedFileName(file.name);
-        setIsProcessingUpload(false); // End loading indicator
+      reader.onloadend = async () => {
+        const audioDataUri = reader.result as string;
+        setUploadedAudioDataUri(audioDataUri);
+        setUploadedFileName(file.name); // Set actual name after reading
         toast({
           title: 'File Uploaded',
-          description: `${file.name} is ready.`, // Add hint for next step if applicable
+          description: `Transcribing ${file.name}...`,
         });
-         // TODO: Add logic here to automatically transcribe the uploaded file if desired
-         // For now, just notify the user. Transcription needs a backend or different API.
-         // Example: transcribeUploadedFile(reader.result as string);
-         setFinalTranscript(`Uploaded file: ${file.name}\n(Transcription for uploaded files is not yet implemented)`);
+
+        // --- Call Genkit Flow for Transcription ---
+        try {
+          const result = await transcribeAudio({ audioDataUri });
+          if (result && result.transcription) {
+             setFinalTranscript(result.transcription);
+             toast({
+               title: 'Transcription Successful',
+               description: `Processed ${file.name}.`,
+             });
+          } else {
+             throw new Error("Transcription result is empty or invalid.");
+          }
+        } catch (error) {
+          console.error('Transcription error:', error);
+          const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred during transcription.';
+          toast({
+            title: 'Transcription Failed',
+            description: errorMessage,
+            variant: 'destructive',
+          });
+          setFinalTranscript(`Failed to transcribe: ${file.name}`); // Indicate failure in transcript area
+        } finally {
+          setIsProcessing(false); // End loading indicator regardless of success/failure
+        }
+        // -----------------------------------------
       };
       reader.onerror = () => {
         console.error('Error reading file');
@@ -233,7 +283,7 @@ export default function Home() {
         });
         setUploadedFileName(null);
         setUploadedAudioDataUri(null);
-        setIsProcessingUpload(false);
+        setIsProcessing(false);
         if(fileInputRef.current) fileInputRef.current.value = ''; // Reset file input
       };
       reader.readAsDataURL(file);
@@ -245,13 +295,19 @@ export default function Home() {
   };
 
   const triggerFileUpload = () => {
+    if (isProcessing) return; // Prevent triggering upload while processing
     fileInputRef.current?.click();
   };
 
   const clearUpload = () => {
     setUploadedFileName(null);
     setUploadedAudioDataUri(null);
-    setFinalTranscript(''); // Clear the placeholder text
+    setFinalTranscript('');
+    setIsPlaying(false); // Stop playback if clearing
+     if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.src = '';
+      }
     if(fileInputRef.current) fileInputRef.current.value = ''; // Reset file input
      toast({
         title: 'Upload Cleared',
@@ -259,12 +315,60 @@ export default function Home() {
       });
   }
 
+   const togglePlayback = () => {
+    if (!audioRef.current || !uploadedAudioDataUri) return;
+
+    if (isPlaying) {
+      audioRef.current.pause();
+    } else {
+      audioRef.current.src = uploadedAudioDataUri; // Set source before playing
+      audioRef.current.play().catch(err => {
+          console.error("Error playing audio:", err);
+           toast({ title: "Playback Error", description: "Could not play the audio file.", variant: "destructive" });
+           setIsPlaying(false); // Ensure state is correct on error
+      });
+    }
+     // Play() is async, state change might need slight delay or better handling with events
+     // For simplicity, toggle state directly, but rely on events for accurate final state.
+    setIsPlaying(!isPlaying);
+  };
+
+  const handleSummarize = async () => {
+    if (!finalTranscript || isSummarizing) return;
+
+    setIsSummarizing(true);
+    toast({ title: 'Summarizing', description: 'Generating summary...' });
+
+    try {
+      const result = await summarizeTranscription({ transcription: finalTranscript });
+      if (result && result.summary) {
+        // Maybe display summary in a dialog or separate area? For now, append/replace.
+        setFinalTranscript(`Summary:\n${result.summary}\n\nOriginal Transcription:\n${finalTranscript}`);
+        toast({ title: 'Summary Generated', description: 'Summary added to the transcription.' });
+      } else {
+        throw new Error('Summarization result is empty.');
+      }
+    } catch (error) {
+      console.error('Summarization error:', error);
+      const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred during summarization.';
+      toast({ title: 'Summarization Failed', description: errorMessage, variant: 'destructive' });
+    } finally {
+      setIsSummarizing(false);
+    }
+  };
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (recognitionRef.current) {
         recognitionRef.current.onend = null; // Prevent restart logic after unmount
         recognitionRef.current.stop();
+      }
+       if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.onended = null;
+        audioRef.current.onpause = null;
+        audioRef.current.onerror = null;
       }
     };
   }, []);
@@ -277,9 +381,12 @@ export default function Home() {
     ); // Show loading state or placeholder during server render/hydration
   }
 
-  const currentTranscript = uploadedFileName
-    ? finalTranscript // Show specific message for uploads
-    : finalTranscript + interimTranscript; // Show live transcript for recording
+  const currentTranscript = finalTranscript + interimTranscript; // Always combine for display
+
+  const placeholderText = uploadedFileName
+    ? isProcessing ? `Processing: ${uploadedFileName}...` : `Transcription for ${uploadedFileName}. Ready for download or summary.`
+    : isRecording ? "Listening..."
+    : "Start recording or upload an audio file...";
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen p-4 bg-background">
@@ -295,30 +402,22 @@ export default function Home() {
             <Textarea
               readOnly
               value={currentTranscript}
-              placeholder={
-                uploadedFileName
-                ? `Ready to process: ${uploadedFileName}`
-                : "Start recording or upload an audio file..."
-
-              }
+              placeholder={placeholderText}
               className="h-full w-full resize-none border-0 bg-transparent p-0 focus-visible:ring-0 focus-visible:ring-offset-0"
               aria-live="polite"
             />
-            {isRecording && (
-              <div className="absolute bottom-2 right-2 flex items-center space-x-1 text-xs text-muted-foreground animate-pulse">
-                <div className="h-2 w-2 rounded-full bg-destructive animate-ping duration-1000"></div>
-                <span>Listening...</span>
+            {(isRecording || isProcessing) && (
+              <div className="absolute inset-0 flex items-center justify-center bg-background/50">
+                <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                <span className="ml-2 text-muted-foreground">
+                  {isRecording ? "Listening..." : "Processing..."}
+                </span>
               </div>
-            )}
-             {isProcessingUpload && (
-               <div className="absolute inset-0 flex items-center justify-center bg-background/50">
-                 <Loader2 className="h-8 w-8 animate-spin text-primary" />
-               </div>
             )}
           </div>
 
           {/* Action Buttons */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             {/* Recording Controls */}
             {!isRecording ? (
               <Button
@@ -326,7 +425,7 @@ export default function Home() {
                 size="lg"
                 className="bg-accent hover:bg-accent/90 text-accent-foreground"
                 aria-label="Start recording"
-                disabled={!SpeechRecognition || !!uploadedFileName || isProcessingUpload} // Disable if API not supported or file uploaded or processing
+                disabled={!SpeechRecognition || !!uploadedFileName || isProcessing || isRecording}
               >
                 <Mic className="mr-2 h-5 w-5" />
                 Record
@@ -337,6 +436,7 @@ export default function Home() {
                 size="lg"
                 variant="destructive"
                 aria-label="Stop recording"
+                disabled={!isRecording || isProcessing}
               >
                 <StopCircle className="mr-2 h-5 w-5" />
                 Stop
@@ -348,7 +448,7 @@ export default function Home() {
               onClick={triggerFileUpload}
               size="lg"
               variant="outline"
-              disabled={isRecording || isProcessingUpload} // Disable if recording or processing
+              disabled={isRecording || isProcessing}
               aria-label="Upload audio file"
             >
               <Upload className="mr-2 h-5 w-5" /> Upload File
@@ -362,13 +462,25 @@ export default function Home() {
                 id="audio-upload"
              />
 
+             {/* Summarize Button */}
+            <Button
+              onClick={handleSummarize}
+              size="lg"
+              variant="outline"
+              disabled={!finalTranscript || isSummarizing || isProcessing || isRecording}
+              aria-label="Summarize transcription"
+            >
+              {isSummarizing ? <Loader2 className="mr-2 h-5 w-5 animate-spin" /> : <Wand2 className="mr-2 h-5 w-5" />}
+              Summarize
+            </Button>
+
 
             {/* Download */}
             <Button
               onClick={downloadTranscript}
               size="lg"
               variant="outline"
-              disabled={!finalTranscript || isRecording || uploadedFileName === 'Processing...'} // Disable if no text, recording, or processing upload
+              disabled={!finalTranscript || isProcessing || isRecording}
               aria-label="Download transcription"
             >
               <Download className="mr-2 h-5 w-5" />
@@ -376,26 +488,30 @@ export default function Home() {
             </Button>
           </div>
 
-            {/* Uploaded File Info / Clear Button */}
-           {uploadedFileName && !isProcessingUpload && (
+            {/* Uploaded File Info / Playback / Clear Button */}
+           {uploadedFileName && !isProcessing && (
             <div className="flex items-center justify-between p-2 border rounded-md bg-muted">
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <FileAudio className="h-4 w-4" />
-                    <span className="truncate">{uploadedFileName}</span>
+                <div className="flex items-center gap-2 text-sm text-muted-foreground overflow-hidden">
+                     <Button onClick={togglePlayback} variant="ghost" size="icon" className="h-6 w-6 shrink-0" disabled={!uploadedAudioDataUri}>
+                       {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                       <span className="sr-only">{isPlaying ? 'Pause audio' : 'Play audio'}</span>
+                    </Button>
+                    <FileAudio className="h-4 w-4 shrink-0" />
+                    <span className="truncate" title={uploadedFileName}>{uploadedFileName}</span>
                 </div>
-                <Button onClick={clearUpload} variant="ghost" size="sm" className="text-destructive hover:text-destructive/80">Clear</Button>
+                <Button onClick={clearUpload} variant="ghost" size="sm" className="text-destructive hover:text-destructive/80 shrink-0">Clear</Button>
             </div>
             )}
 
 
           {!SpeechRecognition && (
              <p className="text-center text-sm text-destructive">
-               Live speech recognition is not supported by your browser. Uploading files might still work.
+               Live speech recognition is not supported by your browser. Uploading files should still work.
              </p>
           )}
         </CardContent>
          <CardFooter className="text-xs text-muted-foreground text-center justify-center pt-4 border-t">
-           <p>Use live recording (Chrome/Edge) or upload an audio file.</p>
+           <p>Use live recording (Chrome/Edge recommended) or upload an audio file for transcription.</p>
         </CardFooter>
       </Card>
     </div>
